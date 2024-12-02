@@ -8,7 +8,15 @@ import torch
 import vllm
 from blingfire import text_to_sentences_and_offsets
 from bs4 import BeautifulSoup
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from sentence_transformers import SentenceTransformer
+from llama_index.core.postprocessor import SentenceTransformerRerank
+from llama_index.core import VectorStoreIndex
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.schema import Document
+import newspaper
+import html
+import threading
 
 from openai import OpenAI
 
@@ -17,11 +25,11 @@ from tqdm import tqdm
 #### CONFIG PARAMETERS ---
 
 # Define the number of context sentences to consider for generating an answer.
-NUM_CONTEXT_SENTENCES = 20
+NUM_CONTEXT_SENTENCES = 10 # 20
 # Set the maximum length for each context sentence (in characters).
 MAX_CONTEXT_SENTENCE_LENGTH = 1000
 # Set the maximum context references length (in characters).
-MAX_CONTEXT_REFERENCES_LENGTH = 1000
+MAX_CONTEXT_REFERENCES_LENGTH = 4000
 
 # Batch size you wish the evaluators will use to call the `batch_generate_answer` function
 AICROWD_SUBMISSION_BATCH_SIZE = 1 # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
@@ -36,9 +44,46 @@ SENTENTENCE_TRANSFORMER_BATCH_SIZE = 32 # TUNE THIS VARIABLE depending on the si
 #### CONFIG PARAMETERS END---
 
 class ChunkExtractor:
+    # Testing idea from: https://github.com/USTCAGI/CRAG-in-KDD-Cup2024/blob/master/models/retrieve/retriever.py
+    # CRAG 2nd place team
+    # Use the newspaper3k package to parse text from HTML. Then, we can split them up into 256 token chunks, get their
+    # embeddings, and then rank them.
+    def get_text(self, html):
+        if html is None or html.strip() == "":
+            return ""
+        soup = BeautifulSoup(
+            html, features="lxml"
+        )
+        return soup.get_text(" ", strip=True)
+        # article = newspaper.Article('')
+        # article.set_html(html)
+        # try:
+        #     article.parse()
+        #     print("parsed article")
+        #     return article.text
+        # except:
+        #     print("using beautiful soup")
+        #     soup = BeautifulSoup(
+        #         html, features="lxml"
+        #     )
+        #     return soup.get_text(" ", strip=True)
+            # return text.replace("\n", " ")
+
+    def get_html_text_threaded(self, html, timeout=20):
+        text = ""
+        def timeout_function():
+            nonlocal text
+            text = self.get_text(html)
+        thread = threading.Thread(target=timeout_function)
+        thread.start()
+        thread.join(timeout)
+
+        if thread.is_alive():
+            print("Timeout occurred")
+        return text
 
     @ray.remote
-    def _extract_chunks(self, interaction_id, html_source):
+    def _extract_chunks(self, html_source):
         """
         Extracts and returns chunks from given HTML source.
 
@@ -54,26 +99,31 @@ class ChunkExtractor:
             Tuple[str, List[str]]: A tuple containing the interaction ID and a list of sentences extracted from the HTML content.
         """
         # Parse the HTML content using BeautifulSoup
-        soup = BeautifulSoup(html_source, "lxml")
-        text = soup.get_text(" ", strip=True)  # Use space as a separator, strip whitespaces
-
-        if not text:
+        # soup = BeautifulSoup(html["page_result"], "lxml")
+        # text = soup.get_text(" ", strip=True)  # Use space as a separator, strip whitespaces
+        # text = soup.get_text().replace("\n", " ")
+        text = self.get_html_text_threaded(html_source["page_result"])
+        snippet = html.unescape(html_source["page_snippet"]) # also extract snippet context to get shorter summary
+        # if not text:
             # Return a list with empty string when no text is extracted
-            return interaction_id, [""]
+            # return interaction_id, [""]
+        return text, snippet 
 
         # Extract offsets of sentences from the text
-        _, offsets = text_to_sentences_and_offsets(text)
+        # _, offsets = text_to_sentences_and_offsets(text)
 
         # Initialize a list to store sentences
-        chunks = []
+        # chunks = []
 
         # Iterate through the list of offsets and extract sentences
+        # BASELINE SOLUTION gets each sentence and limits each sentence to 1000 characters (shouldn't be broken)
         for start, end in offsets:
             # Extract the sentence and limit its length
             sentence = text[start:end][:MAX_CONTEXT_SENTENCE_LENGTH]
             chunks.append(sentence)
 
-        return interaction_id, chunks
+        # return interaction_id, chunks
+        # return chunks, snippet
 
     def extract_chunks(self, batch_interaction_ids, batch_search_results):
         """
@@ -90,25 +140,29 @@ class ChunkExtractor:
         ray_response_refs = [
             self._extract_chunks.remote(
                 self,
-                interaction_id=batch_interaction_ids[idx],
-                html_source=html_text["page_result"]
+                html_source
             )
-            for idx, search_results in enumerate(batch_search_results)
-            for html_text in search_results
+            for html_source in batch_search_results
         ]
 
         # Wait until all sentence extractions are complete
         # and collect chunks for every interaction_id separately
-        chunk_dictionary = defaultdict(list)
-
+        # chunk_dictionary = defaultdict(list)
+        docs = []
         for response_ref in ray_response_refs:
-            interaction_id, _chunks = ray.get(response_ref)  # Blocking call until parallel execution is complete
-            chunk_dictionary[interaction_id].extend(_chunks)
+            # interaction_id, _chunks = ray.get(response_ref)  # Blocking call until parallel execution is complete
+            # chunk_dictionary[interaction_id].extend(_chunks)
+            text, snippet = ray.get(response_ref)
+            if len(text) > 0:
+                docs.append(Document(text=text))
+            if len(snippet) > 0:
+                docs.append(Document(snippet=snippet))
+        
+        return docs
 
         # Flatten chunks and keep a map of corresponding interaction_ids
-        chunks, chunk_interaction_ids = self._flatten_chunks(chunk_dictionary)
-
-        return chunks, chunk_interaction_ids
+        # chunks, chunk_interaction_ids = self._flatten_chunks(chunk_dictionary)
+        # return chunks, chunk_interaction_ids
 
     def _flatten_chunks(self, chunk_dictionary):
         """
@@ -135,7 +189,7 @@ class ChunkExtractor:
 
         return chunks, chunk_interaction_ids
 
-class RAGModel:
+class RAGModelSaim:
     """
     An example RAGModel for the KDDCup 2024 Meta CRAG Challenge
     which includes all the key components of a RAG lifecycle.
@@ -154,10 +208,8 @@ class RAGModel:
             openai_api_key = "EMPTY"
             openai_api_base = self.vllm_server
             self.llm_client = OpenAI(
-                # api_key=openai_api_key,
-                # base_url=openai_api_base,
-                api_key=os.environ.get("GROQ_API_KEY"),
-                base_url="https://api.groq.com/openai/v1",
+                api_key=openai_api_key,
+                base_url=openai_api_base,
             )
         else:
             # initialize the model with vllm offline inference
@@ -173,12 +225,20 @@ class RAGModel:
             self.tokenizer = self.llm.get_tokenizer()
 
         # Load a sentence transformer model optimized for sentence embeddings, using CUDA if available.
-        self.sentence_model = SentenceTransformer(
-            # "BAAI/bge-m3",
-            "all-MiniLM-L6-v2",
-            device=torch.device(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            ),
+        # self.sentence_model = SentenceTransformer(
+        #     "all-MiniLM-L6-v2",
+        #     device=torch.device(
+        #         "cuda" if torch.cuda.is_available() else "cpu"
+        #     ),
+        # )
+        self.sentence_model = HuggingFaceEmbedding(
+            "BAAI/bge-m3",
+            device="cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.rerank_model = SentenceTransformerRerank(
+            top_n=5,
+            model="BAAI/bge-reranker-v2-m3",
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
     def calculate_embeddings(self, sentences):
@@ -252,48 +312,70 @@ class RAGModel:
         query_times = batch["query_time"]
 
         # Chunk all search results using ChunkExtractor
-        chunks, chunk_interaction_ids = self.chunk_extractor.extract_chunks(
-            batch_interaction_ids, batch_search_results
-        )
-
-        # Calculate all chunk embeddings
-        chunk_embeddings = self.calculate_embeddings(chunks)
-
-        # Calculate embeddings for queries
-        query_embeddings = self.calculate_embeddings(queries)
-
-        # Retrieve top matches for the whole batch
-        batch_retrieval_results = []
+        batch_results = []
         for _idx, interaction_id in enumerate(batch_interaction_ids):
             query = queries[_idx]
-            query_time = query_times[_idx]
-            query_embedding = query_embeddings[_idx]
+            search_result = batch_search_results[_idx]
 
-            # Identify chunks that belong to this interaction_id
-            relevant_chunks_mask = chunk_interaction_ids == interaction_id
+            docs = self.chunk_extractor.extract_chunks(batch_interaction_ids, search_result)
+            print(docs)
+            node_parser = SentenceSplitter(chunk_size=512, chunk_overlap=20) # TODO: tune these parms
+            print("getting nodes")
+            nodes = node_parser.get_nodes_from_documents(docs)
+            print("building index")
+            index = VectorStoreIndex(nodes, embed_model=self.sentence_model)
+            retriever = index.as_retriever(similarity_top_k=NUM_CONTEXT_SENTENCES)
+            print("retrieving")
+            nodes = retriever.retrieve(query)
+            print(len(nodes))
+            batch_results.append([node.get_text().strip() for node in nodes])
 
-            # Filter out the said chunks and corresponding embeddings
-            relevant_chunks = chunks[relevant_chunks_mask]
-            relevant_chunks_embeddings = chunk_embeddings[relevant_chunks_mask]
+        # batch_retrieval_results = []
+        # for _idx, _ in enumerate(batch_interaction_ids):
 
-            # Calculate cosine similarity between query and chunk embeddings,
-            cosine_scores = (relevant_chunks_embeddings * query_embedding).sum(1)
+        # chunks, chunk_interaction_ids = self.chunk_extractor.extract_chunks(
+        #     batch_interaction_ids, batch_search_results
+        # )
 
-            # and retrieve top-N results.
-            retrieval_results = relevant_chunks[
-                (-cosine_scores).argsort()[:NUM_CONTEXT_SENTENCES]
-            ]
+        # # Calculate all chunk embeddings
+        # chunk_embeddings = self.calculate_embeddings(chunks)
+
+        # # Calculate embeddings for queries
+        # query_embeddings = self.calculate_embeddings(queries)
+
+        # # Retrieve top matches for the whole batch
+        # batch_retrieval_results = []
+        # for _idx, interaction_id in enumerate(batch_interaction_ids):
+        #     query = queries[_idx]
+        #     query_time = query_times[_idx]
+        #     query_embedding = query_embeddings[_idx]
+
+        #     # Identify chunks that belong to this interaction_id
+        #     relevant_chunks_mask = chunk_interaction_ids == interaction_id
+
+        #     # Filter out the said chunks and corresponding embeddings
+        #     relevant_chunks = chunks[relevant_chunks_mask]
+        #     relevant_chunks_embeddings = chunk_embeddings[relevant_chunks_mask]
+
+        #     # Calculate cosine similarity between query and chunk embeddings,
+        #     cosine_scores = (relevant_chunks_embeddings * query_embedding).sum(1)
+
+        #     # and retrieve top-N results.
+        #     retrieval_results = relevant_chunks[
+        #         (-cosine_scores).argsort()[:NUM_CONTEXT_SENTENCES]
+        #     ]
             
-            # You might also choose to skip the steps above and 
-            # use a vectorDB directly.
-            batch_retrieval_results.append(retrieval_results)
+        #     # You might also choose to skip the steps above and 
+        #     # use a vectorDB directly.
+        #     batch_retrieval_results.append(retrieval_results)
             
         # Prepare formatted prompts from the LLM        
-        formatted_prompts = self.format_prompts(queries, query_times, batch_retrieval_results)
+        formatted_prompts = self.format_prompts(queries, query_times, batch_results)
 
         # Generate responses via vllm
         # note that here self.batch_size = 1
-        print(formatted_prompts[0])
+        # print(formatted_prompts[0])
+        print(len(batch_results))
         if self.is_server:
             response = self.llm_client.chat.completions.create(
                 model=self.llm_name,
@@ -301,7 +383,6 @@ class RAGModel:
                 n=1,  # Number of output sequences to return for each prompt.
                 top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
                 temperature=0.1,  # randomness of the sampling
-                # skip_special_tokens=True,  # Whether to skip special tokens in the output.
                 max_tokens=50,  # Maximum number of tokens to generate per output sequence.
             )
             answers = [response.choices[0].message.content]
@@ -347,11 +428,10 @@ class RAGModel:
                 # Format the top sentences as references in the model's prompt template.
                 for _snippet_idx, snippet in enumerate(retrieval_results):
                     references += f"- {snippet.strip()}\n"
-                    # Exit early to avoid adding a portion of a reference which can be mis-interpreted
-                    if len(references) > MAX_CONTEXT_REFERENCES_LENGTH:
+                if len(references) > MAX_CONTEXT_REFERENCES_LENGTH:
                         break
             
-            # references = references[:MAX_CONTEXT_REFERENCES_LENGTH]
+            references = references[:MAX_CONTEXT_REFERENCES_LENGTH]
             # Limit the length of references to fit the model's input size.
 
             user_message += f"{references}\n------\n\n"
@@ -382,4 +462,3 @@ class RAGModel:
                 )
 
         return formatted_prompts
-
