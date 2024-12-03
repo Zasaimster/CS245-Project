@@ -13,7 +13,7 @@ from sentence_transformers import SentenceTransformer
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core import VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.schema import Document
+from llama_index.core.schema import Document, QueryBundle
 import newspaper
 import html
 import threading
@@ -26,17 +26,15 @@ from tqdm import tqdm
 
 # Define the number of context sentences to consider for generating an answer.
 NUM_CONTEXT_SENTENCES = 10 # 20
-# Set the maximum length for each context sentence (in characters).
-MAX_CONTEXT_SENTENCE_LENGTH = 1000
 # Set the maximum context references length (in characters).
-MAX_CONTEXT_REFERENCES_LENGTH = 4000
+MAX_CONTEXT_REFERENCES_LENGTH = 1950
 
 # Batch size you wish the evaluators will use to call the `batch_generate_answer` function
-AICROWD_SUBMISSION_BATCH_SIZE = 1 # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
+AICROWD_SUBMISSION_BATCH_SIZE = 32 # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
 
 # VLLM Parameters 
 VLLM_TENSOR_PARALLEL_SIZE = 1 # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
-VLLM_GPU_MEMORY_UTILIZATION = 0.85 # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
+VLLM_GPU_MEMORY_UTILIZATION = 0.8 # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
 
 # Sentence Transformer Parameters
 SENTENTENCE_TRANSFORMER_BATCH_SIZE = 32 # TUNE THIS VARIABLE depending on the size of your embedding model and GPU mem available
@@ -46,28 +44,25 @@ SENTENTENCE_TRANSFORMER_BATCH_SIZE = 32 # TUNE THIS VARIABLE depending on the si
 class ChunkExtractor:
     # Testing idea from: https://github.com/USTCAGI/CRAG-in-KDD-Cup2024/blob/master/models/retrieve/retriever.py
     # CRAG 2nd place team
-    # Use the newspaper3k package to parse text from HTML. Then, we can split them up into 256 token chunks, get their
-    # embeddings, and then rank them.
+    # Use the newspaper3k package to parse text from HTML.
     def get_text(self, html):
         if html is None or html.strip() == "":
             return ""
-        soup = BeautifulSoup(
-            html, features="lxml"
-        )
-        return soup.get_text(" ", strip=True)
-        # article = newspaper.Article('')
-        # article.set_html(html)
-        # try:
-        #     article.parse()
-        #     print("parsed article")
-        #     return article.text
-        # except:
-        #     print("using beautiful soup")
-        #     soup = BeautifulSoup(
-        #         html, features="lxml"
-        #     )
-        #     return soup.get_text(" ", strip=True)
-            # return text.replace("\n", " ")
+        # soup = BeautifulSoup(
+        #     html, features="lxml"
+        # )
+        # return soup.get_text(" ", strip=True)
+        article = newspaper.Article('')
+        article.set_html(html)
+        try:
+            article.parse()
+            return article.text
+        except:
+            soup = BeautifulSoup(
+                html, features="lxml"
+            )
+            return soup.get_text(" ", strip=True)
+            return text.replace("\n", " ")
 
     def get_html_text_threaded(self, html, timeout=20):
         text = ""
@@ -98,34 +93,11 @@ class ChunkExtractor:
         Returns:
             Tuple[str, List[str]]: A tuple containing the interaction ID and a list of sentences extracted from the HTML content.
         """
-        # Parse the HTML content using BeautifulSoup
-        # soup = BeautifulSoup(html["page_result"], "lxml")
-        # text = soup.get_text(" ", strip=True)  # Use space as a separator, strip whitespaces
-        # text = soup.get_text().replace("\n", " ")
         text = self.get_html_text_threaded(html_source["page_result"])
         snippet = html.unescape(html_source["page_snippet"]) # also extract snippet context to get shorter summary
-        # if not text:
-            # Return a list with empty string when no text is extracted
-            # return interaction_id, [""]
         return text, snippet 
 
-        # Extract offsets of sentences from the text
-        # _, offsets = text_to_sentences_and_offsets(text)
-
-        # Initialize a list to store sentences
-        # chunks = []
-
-        # Iterate through the list of offsets and extract sentences
-        # BASELINE SOLUTION gets each sentence and limits each sentence to 1000 characters (shouldn't be broken)
-        for start, end in offsets:
-            # Extract the sentence and limit its length
-            sentence = text[start:end][:MAX_CONTEXT_SENTENCE_LENGTH]
-            chunks.append(sentence)
-
-        # return interaction_id, chunks
-        # return chunks, snippet
-
-    def extract_chunks(self, batch_interaction_ids, batch_search_results):
+    def extract_chunks(self, batch_search_results):
         """
         Extracts chunks from given batch search results using parallel processing with Ray.
 
@@ -137,57 +109,35 @@ class ChunkExtractor:
             Tuple[np.ndarray, np.ndarray]: A tuple containing an array of chunks and an array of corresponding interaction IDs.
         """
         # Setup parallel chunk extraction using ray remote
+        # inspect page_url to make sure they are all unique
+        page_urls = set()
+        search_res = []
+        for result in batch_search_results:
+            if not result["page_url"] in page_urls:
+                search_res.append(result)
+                page_urls.add(result["page_url"])
+
         ray_response_refs = [
             self._extract_chunks.remote(
                 self,
                 html_source
             )
-            for html_source in batch_search_results
+            for html_source in search_res
         ]
 
-        # Wait until all sentence extractions are complete
-        # and collect chunks for every interaction_id separately
-        # chunk_dictionary = defaultdict(list)
         docs = []
         for response_ref in ray_response_refs:
-            # interaction_id, _chunks = ray.get(response_ref)  # Blocking call until parallel execution is complete
-            # chunk_dictionary[interaction_id].extend(_chunks)
             text, snippet = ray.get(response_ref)
-            if len(text) > 0:
-                docs.append(Document(text=text))
-            if len(snippet) > 0:
-                docs.append(Document(snippet=snippet))
+            new_doc = Document(text=text)
+            # For some reason checking the length of text and snippet doesn't work correctly
+            if len(new_doc.text) > 0:
+                docs.append(new_doc)
+            new_doc = Document(text=snippet)
+            if len(new_doc.text) > 0:
+                docs.append(new_doc)
         
         return docs
 
-        # Flatten chunks and keep a map of corresponding interaction_ids
-        # chunks, chunk_interaction_ids = self._flatten_chunks(chunk_dictionary)
-        # return chunks, chunk_interaction_ids
-
-    def _flatten_chunks(self, chunk_dictionary):
-        """
-        Flattens the chunk dictionary into separate lists for chunks and their corresponding interaction IDs.
-
-        Parameters:
-            chunk_dictionary (defaultdict): Dictionary with interaction IDs as keys and lists of chunks as values.
-
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: A tuple containing an array of chunks and an array of corresponding interaction IDs.
-        """
-        chunks = []
-        chunk_interaction_ids = []
-
-        for interaction_id, _chunks in chunk_dictionary.items():
-            # De-duplicate chunks within the scope of an interaction ID
-            unique_chunks = list(set(_chunks))
-            chunks.extend(unique_chunks)
-            chunk_interaction_ids.extend([interaction_id] * len(unique_chunks))
-
-        # Convert to numpy arrays for convenient slicing/masking operations later
-        chunks = np.array(chunks)
-        chunk_interaction_ids = np.array(chunk_interaction_ids)
-
-        return chunks, chunk_interaction_ids
 
 class RAGModelSaim:
     """
@@ -218,6 +168,7 @@ class RAGModelSaim:
                 worker_use_ray=True,
                 tensor_parallel_size=VLLM_TENSOR_PARALLEL_SIZE,
                 gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
+                max_model_len=2048,
                 trust_remote_code=True,
                 dtype="half",  # note: bfloat16 is not supported on nvidia-T4 GPUs
                 enforce_eager=True
@@ -225,47 +176,17 @@ class RAGModelSaim:
             self.tokenizer = self.llm.get_tokenizer()
 
         # Load a sentence transformer model optimized for sentence embeddings, using CUDA if available.
-        # self.sentence_model = SentenceTransformer(
-        #     "all-MiniLM-L6-v2",
-        #     device=torch.device(
-        #         "cuda" if torch.cuda.is_available() else "cpu"
-        #     ),
-        # )
         self.sentence_model = HuggingFaceEmbedding(
-            "BAAI/bge-m3",
+            # "all-MiniLM-L6-v2",
+            # "BAAI/bge-m3",
+            "thenlper/gte-large",
             device="cuda" if torch.cuda.is_available() else "cpu"
         )
         self.rerank_model = SentenceTransformerRerank(
-            top_n=5,
+            top_n=5, 
             model="BAAI/bge-reranker-v2-m3",
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
-
-    def calculate_embeddings(self, sentences):
-        """
-        Compute normalized embeddings for a list of sentences using a sentence encoding model.
-
-        This function leverages multiprocessing to encode the sentences, which can enhance the
-        processing speed on multi-core machines.
-
-        Args:
-            sentences (List[str]): A list of sentences for which embeddings are to be computed.
-
-        Returns:
-            np.ndarray: An array of normalized embeddings for the given sentences.
-
-        """
-        embeddings = self.sentence_model.encode(
-            sentences=sentences,
-            normalize_embeddings=True,
-            batch_size=SENTENTENCE_TRANSFORMER_BATCH_SIZE,
-        )
-        # Note: There is an opportunity to parallelize the embedding generation across 4 GPUs
-        #       but sentence_model.encode_multi_process seems to interefere with Ray
-        #       on the evaluation servers. 
-        #       todo: this can also be done in a Ray native approach.
-        #       
-        return embeddings
 
     def get_batch_size(self) -> int:
         """
@@ -313,69 +234,29 @@ class RAGModelSaim:
 
         # Chunk all search results using ChunkExtractor
         batch_results = []
-        for _idx, interaction_id in enumerate(batch_interaction_ids):
+        for _idx, _ in enumerate(batch_interaction_ids):
             query = queries[_idx]
             search_result = batch_search_results[_idx]
 
-            docs = self.chunk_extractor.extract_chunks(batch_interaction_ids, search_result)
-            print(docs)
-            node_parser = SentenceSplitter(chunk_size=512, chunk_overlap=20) # TODO: tune these parms
-            print("getting nodes")
+            docs = self.chunk_extractor.extract_chunks(search_result)
+            node_parser = SentenceSplitter(chunk_size=256, chunk_overlap=20)
             nodes = node_parser.get_nodes_from_documents(docs)
-            print("building index")
             index = VectorStoreIndex(nodes, embed_model=self.sentence_model)
             retriever = index.as_retriever(similarity_top_k=NUM_CONTEXT_SENTENCES)
-            print("retrieving")
             nodes = retriever.retrieve(query)
-            print(len(nodes))
-            batch_results.append([node.get_text().strip() for node in nodes])
+            # batch_results.append([node.get_text().strip() for node in nodes])
 
-        # batch_retrieval_results = []
-        # for _idx, _ in enumerate(batch_interaction_ids):
-
-        # chunks, chunk_interaction_ids = self.chunk_extractor.extract_chunks(
-        #     batch_interaction_ids, batch_search_results
-        # )
-
-        # # Calculate all chunk embeddings
-        # chunk_embeddings = self.calculate_embeddings(chunks)
-
-        # # Calculate embeddings for queries
-        # query_embeddings = self.calculate_embeddings(queries)
-
-        # # Retrieve top matches for the whole batch
-        # batch_retrieval_results = []
-        # for _idx, interaction_id in enumerate(batch_interaction_ids):
-        #     query = queries[_idx]
-        #     query_time = query_times[_idx]
-        #     query_embedding = query_embeddings[_idx]
-
-        #     # Identify chunks that belong to this interaction_id
-        #     relevant_chunks_mask = chunk_interaction_ids == interaction_id
-
-        #     # Filter out the said chunks and corresponding embeddings
-        #     relevant_chunks = chunks[relevant_chunks_mask]
-        #     relevant_chunks_embeddings = chunk_embeddings[relevant_chunks_mask]
-
-        #     # Calculate cosine similarity between query and chunk embeddings,
-        #     cosine_scores = (relevant_chunks_embeddings * query_embedding).sum(1)
-
-        #     # and retrieve top-N results.
-        #     retrieval_results = relevant_chunks[
-        #         (-cosine_scores).argsort()[:NUM_CONTEXT_SENTENCES]
-        #     ]
-            
-        #     # You might also choose to skip the steps above and 
-        #     # use a vectorDB directly.
-        #     batch_retrieval_results.append(retrieval_results)
+            reranked_nodes = self.rerank_model.postprocess_nodes(
+                nodes,
+                query_bundle=QueryBundle(query_str=query)
+            )
+            batch_results.append([node.get_text().strip() for node in reranked_nodes])
             
         # Prepare formatted prompts from the LLM        
         formatted_prompts = self.format_prompts(queries, query_times, batch_results)
 
         # Generate responses via vllm
         # note that here self.batch_size = 1
-        # print(formatted_prompts[0])
-        print(len(batch_results))
         if self.is_server:
             response = self.llm_client.chat.completions.create(
                 model=self.llm_name,
@@ -383,23 +264,26 @@ class RAGModelSaim:
                 n=1,  # Number of output sequences to return for each prompt.
                 top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
                 temperature=0.1,  # randomness of the sampling
-                max_tokens=50,  # Maximum number of tokens to generate per output sequence.
+                max_tokens=150,  # Maximum number of tokens to generate per output sequence.
             )
             answers = [response.choices[0].message.content]
+            print(f"answer: {answers[0]}")
         else:
             responses = self.llm.generate(
                 formatted_prompts,
                 vllm.SamplingParams(
                     n=1,  # Number of output sequences to return for each prompt.
                     top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
-                    temperature=0.1,  # randomness of the sampling
+                    temperature=0, #0.1,  # randomness of the sampling
                     skip_special_tokens=True,  # Whether to skip special tokens in the output.
-                    max_tokens=50,  # Maximum number of tokens to generate per output sequence.
+                    max_tokens=100,  # Maximum number of tokens to generate per output sequence.
                 ),
                 use_tqdm=False
             )
             answers = []
-            for response in responses:
+            for i, response in enumerate(responses):
+                print(f"Q: {queries[i]}")
+                print(f"A: {response.outputs[0].text}")
                 answers.append(response.outputs[0].text)
 
         return answers
@@ -414,8 +298,8 @@ class RAGModelSaim:
         - batch_retrieval_results (List[str])
         """        
         system_prompt = "You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible. If the references do not contain the necessary information to answer the question, respond with 'I don't know'. There is no need to explain the reasoning behind your answers."
+        # system_prompt = "You are a helpful assistant"
         formatted_prompts = []
-
         for _idx, query in enumerate(queries):
             query_time = query_times[_idx]
             retrieval_results = batch_retrieval_results[_idx]
@@ -428,15 +312,18 @@ class RAGModelSaim:
                 # Format the top sentences as references in the model's prompt template.
                 for _snippet_idx, snippet in enumerate(retrieval_results):
                     references += f"- {snippet.strip()}\n"
-                if len(references) > MAX_CONTEXT_REFERENCES_LENGTH:
+                    if len(references) > MAX_CONTEXT_REFERENCES_LENGTH:
                         break
             
             references = references[:MAX_CONTEXT_REFERENCES_LENGTH]
             # Limit the length of references to fit the model's input size.
 
+            # user_message += f"{references}\n------\n\n"
+            # user_message 
+            user_message += f"Using only the references listed above, answer the following question. Think step by step and then provide the final answer. Note: - If the question contains ANY factual errors or is inherently incorrect, you MUST reply `invalid question`.\n - For the final answer, use as few words as possible  \n"
+            # user_message += "For the following question and list of references from web pages, think step by step and then provide the final answer. \n"
+            # user_message += "Note: \n - For the final answer, use as few words as possible.\n - If the question contains ANY factual errors, you MUST reply `invalid question`.\n - If you don't know the answer, you MUST reply `I don't know`.\n - The output format MUST meet the requirements: Start with `# Thought process\n` and then output the thought process regarding how you answer the question. You MUST not repeat statements. After you finish thinking, you must reply with the final answer on the last line, starting with `# Final Answer\n` and use as few words as possible."
             user_message += f"{references}\n------\n\n"
-            user_message 
-            user_message += f"Using only the references listed above, answer the following question: \n"
             user_message += f"Current Time: {query_time}\n"
             user_message += f"Question: {query}\n"
 

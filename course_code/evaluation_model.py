@@ -48,6 +48,7 @@ class EvaluationModel:
                 tensor_parallel_size=VLLM_TENSOR_PARALLEL_SIZE,
                 gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
                 trust_remote_code=True,
+                # max_model_len=2048,
                 dtype="half",  # note: bfloat16 is not supported on nvidia-T4 GPUs
                 enforce_eager=True
             )
