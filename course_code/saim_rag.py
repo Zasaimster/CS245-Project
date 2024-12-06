@@ -27,7 +27,8 @@ from tqdm import tqdm
 # Define the number of context sentences to consider for generating an answer.
 NUM_CONTEXT_SENTENCES = 10 # 20
 # Set the maximum context references length (in characters).
-MAX_CONTEXT_REFERENCES_LENGTH = 1950
+MAX_CONTEXT_REFERENCES_LENGTH = 950 # 1950
+MAX_MODEL_LEN = 1024
 
 # Batch size you wish the evaluators will use to call the `batch_generate_answer` function
 AICROWD_SUBMISSION_BATCH_SIZE = 32 # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
@@ -168,7 +169,7 @@ class RAGModelSaim:
                 worker_use_ray=True,
                 tensor_parallel_size=VLLM_TENSOR_PARALLEL_SIZE,
                 gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
-                max_model_len=2048,
+                max_model_len=MAX_MODEL_LEN,
                 trust_remote_code=True,
                 dtype="half",  # note: bfloat16 is not supported on nvidia-T4 GPUs
                 enforce_eager=True
@@ -177,9 +178,9 @@ class RAGModelSaim:
 
         # Load a sentence transformer model optimized for sentence embeddings, using CUDA if available.
         self.sentence_model = HuggingFaceEmbedding(
-            # "all-MiniLM-L6-v2",
+            "all-MiniLM-L6-v2",
             # "BAAI/bge-m3",
-            "thenlper/gte-large",
+            # "thenlper/gte-large",
             device="cuda" if torch.cuda.is_available() else "cpu"
         )
         self.rerank_model = SentenceTransformerRerank(
@@ -244,7 +245,6 @@ class RAGModelSaim:
             index = VectorStoreIndex(nodes, embed_model=self.sentence_model)
             retriever = index.as_retriever(similarity_top_k=NUM_CONTEXT_SENTENCES)
             nodes = retriever.retrieve(query)
-            # batch_results.append([node.get_text().strip() for node in nodes])
 
             reranked_nodes = self.rerank_model.postprocess_nodes(
                 nodes,
@@ -298,7 +298,6 @@ class RAGModelSaim:
         - batch_retrieval_results (List[str])
         """        
         system_prompt = "You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible. If the references do not contain the necessary information to answer the question, respond with 'I don't know'. There is no need to explain the reasoning behind your answers."
-        # system_prompt = "You are a helpful assistant"
         formatted_prompts = []
         for _idx, query in enumerate(queries):
             query_time = query_times[_idx]
@@ -320,8 +319,8 @@ class RAGModelSaim:
 
             # user_message += f"{references}\n------\n\n"
             # user_message 
-            user_message += f"Using only the references listed above, answer the following question. Think step by step and then provide the final answer. Note: - If the question contains ANY factual errors or is inherently incorrect, you MUST reply `invalid question`.\n - For the final answer, use as few words as possible  \n"
-            # user_message += "For the following question and list of references from web pages, think step by step and then provide the final answer. \n"
+            # user_message += f"Using only the references listed above, answer the following question. Think step by step and then provide the final answer. Note: - If the question contains ANY factual errors or is inherently incorrect, you MUST reply `invalid question`.\n - For the final answer, use as few words as possible  \n"
+            user_message += f"Using only the references listed above, answer the following question: \n"
             # user_message += "Note: \n - For the final answer, use as few words as possible.\n - If the question contains ANY factual errors, you MUST reply `invalid question`.\n - If you don't know the answer, you MUST reply `I don't know`.\n - The output format MUST meet the requirements: Start with `# Thought process\n` and then output the thought process regarding how you answer the question. You MUST not repeat statements. After you finish thinking, you must reply with the final answer on the last line, starting with `# Final Answer\n` and use as few words as possible."
             user_message += f"{references}\n------\n\n"
             user_message += f"Current Time: {query_time}\n"
