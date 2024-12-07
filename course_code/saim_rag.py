@@ -27,8 +27,8 @@ from tqdm import tqdm
 # Define the number of context sentences to consider for generating an answer.
 NUM_CONTEXT_SENTENCES = 10 # 20
 # Set the maximum context references length (in characters).
-MAX_CONTEXT_REFERENCES_LENGTH = 950 # 1950
-MAX_MODEL_LEN = 1024
+MAX_CONTEXT_REFERENCES_LENGTH = 4000 # 1950
+MAX_MODEL_LEN = 4096 # 2048
 
 # Batch size you wish the evaluators will use to call the `batch_generate_answer` function
 AICROWD_SUBMISSION_BATCH_SIZE = 32 # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
@@ -178,9 +178,9 @@ class RAGModelSaim:
 
         # Load a sentence transformer model optimized for sentence embeddings, using CUDA if available.
         self.sentence_model = HuggingFaceEmbedding(
-            "all-MiniLM-L6-v2",
+            # "all-MiniLM-L6-v2",
             # "BAAI/bge-m3",
-            # "thenlper/gte-large",
+            "thenlper/gte-large",
             device="cuda" if torch.cuda.is_available() else "cpu"
         )
         self.rerank_model = SentenceTransformerRerank(
